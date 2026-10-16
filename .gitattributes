@@ -1,0 +1,2 @@
+# 統一換行：所有文字檔一律以 LF 儲存，消除 Windows / macOS / Linux 的 CRLF 警告
+* text=auto eol=lf
