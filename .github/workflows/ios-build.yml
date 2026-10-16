@@ -1,47 +1,26 @@
-﻿name: Build iOS IPA
+﻿name: Build iOS Web Archive
 on:
   push:
     branches: [ main ]
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: ubuntu-latest # 改用最穩定、最快的 Linux 伺服器，完全避開 macOS 佇列與憑證限制
     steps:
     - uses: actions/checkout@v4
     
-    - name: Set up Node.js (2026 Node24 Standard)
+    - name: Set up Node.js (Node24 Standard)
       uses: actions/setup-node@v4
       with:
         node-version: 24
         
     - name: Install Dependencies
-      run: |
-        npm install
+      run: npm install
         
-    - name: Web App Production Build
-      run: |
-        npm run build
+    - name: Web App Production Build (Generate SW and Assets)
+      run: npm run build
         
-    - name: Force Capacitor Sync
-      run: |
-        npx cap sync ios
-        
-    - name: Compile Unsigned App Package via Xcode CLI
-      run: |
-        cd ios/App
-        xcodebuild -workspace App.xcworkspace -scheme App -configuration Debug -sdk iphoneos CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO clean build PROVISIONING_PROFILE_SPECIFIER=""
-        
-    - name: Compress App Package into IPA Structure
-      run: |
-        mkdir -p Payload
-        if [ -d "ios/App/build/Debug-iphoneos/App.app" ]; then
-          cp -r ios/App/build/Debug-iphoneos/App.app Payload/
-        else
-          cp -r ~/Library/Developer/Xcode/DerivedData/*/Build/Products/Debug-iphoneos/App.app Payload/
-        fi
-        zip -r JpnDuoSRS_Unsigned.ipa Payload
-        
-    - name: Export Output IPA Archive
+    - name: Archive Production Build (dist folder)
       uses: actions/upload-artifact@v4
       with:
-        name: JpnDuoSRS-iOS-Package
-        path: JpnDuoSRS_Unsigned.ipa
+        name: JpnDuoSRS-Web-Production
+        path: dist/
