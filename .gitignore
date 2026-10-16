@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# vite-plugin-pwa devOptions 產生的開發用 Service Worker
+dev-dist
