@@ -1,0 +1,24 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ------------------------------------------------------------------
+   SRS 動畫關鍵影格（與 tailwind.config.js 的 animation 對應）
+   以 transform 觸發 GPU 合成，避免 iOS WebView 逐毫秒重排。
+   註：tailwind.config.js 亦宣告了同名 keyframes（雙保險，內容一致，
+      保留其一亦可，重複宣告不影響編譯）。
+------------------------------------------------------------------ */
+@keyframes srsPop {
+  from { transform: scale(0.85); opacity: 0.4; }
+  to   { transform: scale(1);    opacity: 1; }
+}
+
+@keyframes srsSlideUp {
+  from { transform: translateY(100%); }
+  to   { transform: translateY(0); }
+}
+
+@keyframes srsTimerShrink {
+  from { transform: scaleX(1); }
+  to   { transform: scaleX(0); }
+}
