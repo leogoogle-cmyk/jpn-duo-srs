@@ -4,7 +4,7 @@ on:
     branches: [ main ]
 jobs:
   build:
-    runs-on: ubuntu-latest # 改用最穩定、最快的 Linux 伺服器，完全避開 macOS 佇列與憑證限制
+    runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
     
