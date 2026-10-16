@@ -1,15 +1,37 @@
 // src/components/LessonView.tsx
 // ---------------------------------------------------------------------------
-// Duolingo 風格的複習關卡主畫面：把 useSRS 的 SRS 大腦接上 iOS 互動 UI。
+// Duolingo 風格的複習關卡：useQuizEngine（狀態機）+ useSRS（SM-2 大腦）+ iOS 外殼。
+//
+// iOS 重點：
+// - IDLE 預熱畫面：按下「開始」才計時、才朗讀，繞過 iOS「音訊必須由使用者手勢觸發」的限制
+// - 倒數條：純 CSS @keyframes srsTimerShrink（transform: scaleX，GPU 合成）+ onAnimationEnd
+//   以負的 animation-delay 從「實際已經過的時間」接著播放；App 從背景回來時重新掛載即可對時
+// - 安全區域：頂部 env(safe-area-inset-top)、底部 env(safe-area-inset-bottom)
+//   需搭配 index.html 的 viewport-fit=cover
 // ---------------------------------------------------------------------------
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { AnimationEvent, ReactNode } from 'react';
 import { useSRS } from '../hooks/useSRS';
+import { useQuizEngine } from '../hooks/useQuizEngine';
+import {
+  MAX_LESSON_SIZE,
+  TIME_LIMIT_SECONDS,
+  assertNever,
+  buildLessonQuestions,
+  describeCorrectAnswer,
+  speechTextFor,
+  type QuizAnswer,
+  type QuizAttempt,
+  type QuizQuestion,
+  type SentenceTilesQuestion,
+  type WordMeaningQuestion,
+} from '../types/quiz';
 
 // ===========================================================================
-// 型別
+// 型別與常數
 // ===========================================================================
 interface LessonViewProps {
-  /** 離開關卡時呼叫，回傳「本次關卡賺得的總 XP」 */
+  /** 離開關卡時呼叫，回傳「本次關卡已提交的總 XP」 */
   onExit?: (earnedXp: number) => void;
 }
 
@@ -18,47 +40,7 @@ interface FuriganaSegment {
   ruby?: string;
 }
 
-interface Tile {
-  id: number;
-  text: string;
-}
-
-interface McOption {
-  text: string;
-  correct: boolean;
-}
-
-interface QuizResult {
-  correct: boolean;
-  timedOut: boolean;
-  grade: number;
-  /** 本次作答對應的 XP */
-  xp: number;
-}
-
-type Phase = 'answering' | 'result';
-
-// ===========================================================================
-// 常數
-// ===========================================================================
 const INITIAL_LIVES = 5;
-const OPTION_COUNT = 4;
-
-/**
- * 超時分數：0 = 完全答錯 / 超時（不推進 SM-2 排程）。
- * SM-2 中只有 grade >= 3 才會推進複習排程，故超時設 0。
- */
-const TIMEOUT_GRADE = 0;
-
-/** 在此毫秒數內答對視為「完美秒殺」(grade 5)，否則「勉強答對」(grade 3) */
-const QUICK_ANSWER_MS = 7000;
-
-/** SM-2 評分 → XP：完美 50、勉強 30、答錯 / 超時 0 */
-function gradeToXp(grade: number): number {
-  if (grade >= 5) return 50;
-  if (grade >= 3) return 30;
-  return 0;
-}
 
 // ===========================================================================
 // 工具函式
@@ -67,7 +49,10 @@ function gradeToXp(grade: number): number {
 const cx = (...classes: Array<string | false | null | undefined>): string =>
   classes.filter(Boolean).join(' ');
 
-const KANJI_RE = /[㐀-䶿一-鿿豈-﫿々]/;
+/** iOS WebKit 需要 touchstart 監聽器，:active 樣式才會在實機觸發 */
+const noopTouch = (): void => undefined;
+
+const KANJI_RE = /[㐀-䶿一-鿿豈-﫿々]/;
 const isKanji = (ch: string): boolean => KANJI_RE.test(ch);
 const isKana = (ch: string): boolean => /[぀-ゟ゠-ヿ]/.test(ch);
 
@@ -85,18 +70,18 @@ export function buildFurigana(word: string, reading: string): FuriganaSegment[] 
   let i = 0;
 
   while (i < word.length) {
-    if (isKanji(word[i])) {
+    if (isKanji(word.charAt(i))) {
       let end = i;
-      while (end < word.length && isKanji(word[end])) {
+      while (end < word.length && isKanji(word.charAt(end))) {
         end += 1;
       }
       const kanjiText = word.slice(i, end);
 
       let nextKanaIndex = end;
-      while (nextKanaIndex < word.length && !isKana(word[nextKanaIndex])) {
+      while (nextKanaIndex < word.length && !isKana(word.charAt(nextKanaIndex))) {
         nextKanaIndex += 1;
       }
-      const boundaryKana = nextKanaIndex < word.length ? word[nextKanaIndex] : '';
+      const boundaryKana = nextKanaIndex < word.length ? word.charAt(nextKanaIndex) : '';
 
       let rubyEnd: number;
       if (boundaryKana) {
@@ -111,9 +96,9 @@ export function buildFurigana(word: string, reading: string): FuriganaSegment[] 
       r = rubyEnd;
       i = end;
     } else {
-      const ch = word[i];
+      const ch = word.charAt(i);
       segments.push({ text: ch });
-      if (reading[r] === ch) {
+      if (reading.charAt(r) === ch) {
         r += 1;
       } else {
         const found = reading.indexOf(ch, r);
@@ -128,83 +113,35 @@ export function buildFurigana(word: string, reading: string): FuriganaSegment[] 
   return segments;
 }
 
-/** 常見助詞（單字元），切句時獨立成塊 */
-const KANA_PARTICLES = new Set([
-  'は', 'が', 'を', 'に', 'で', 'と', 'も', 'へ', 'の', 'や', 'か', 'ね', 'よ', 'さ', 'な', 'ぞ', 'ぜ', 'わ',
-]);
-
-/** 常見助動詞 / 語尾（多字元），需在助詞之前優先比對 */
-const SENTENCE_AUXILIARIES = ['ませんでした', 'ましょう', 'ません', 'でした', 'ください', 'です', 'ます'];
-
-/** 標點與空白（正則） */
-const PUNCTUATION_RE = /[。、．，！？!?…「」『』（）()・　 ]/;
-
-/**
- * 自動切詞備援（僅在卡片未提供 tiles 時使用）。
- * 以正則判定標點，並依助詞 / 語尾規則切成語塊。
- */
-function tokenizeSentence(sentence: string): string[] {
-  const tokens: string[] = [];
-  let buffer = '';
-
-  const flush = (): void => {
-    if (buffer.length > 0) {
-      tokens.push(buffer);
-      buffer = '';
-    }
-  };
-
-  let i = 0;
-  while (i < sentence.length) {
-    const aux = SENTENCE_AUXILIARIES.find((word) => sentence.startsWith(word, i));
-    if (aux) {
-      flush();
-      tokens.push(aux);
-      i += aux.length;
-      continue;
-    }
-
-    const ch = sentence[i];
-    if (PUNCTUATION_RE.test(ch)) {
-      flush();
-      tokens.push(ch);
-      i += 1;
-      continue;
-    }
-    if (KANA_PARTICLES.has(ch)) {
-      flush();
-      tokens.push(ch);
-      i += 1;
-      continue;
-    }
-
-    buffer += ch;
-    i += 1;
+/** 以系統日文語音朗讀（離線可用；第一次必須在使用者手勢內呼叫） */
+function speakJapanese(text: string): void {
+  try {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = 'ja-JP';
+    utterance.rate = 0.9;
+    window.speechSynthesis.speak(utterance);
+  } catch {
+    /* 部分 WebView 不支援語音合成，忽略即可 */
   }
-  flush();
-
-  return tokens.length > 0 ? tokens : [sentence];
-}
-
-/** Fisher-Yates 洗牌（回傳新陣列，不改動輸入） */
-function shuffle<T>(input: readonly T[]): T[] {
-  const arr = [...input];
-  for (let i = arr.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(Math.random() * (i + 1));
-    const tmp = arr[i];
-    arr[i] = arr[j];
-    arr[j] = tmp;
-  }
-  return arr;
 }
 
 // ===========================================================================
-// 子元件
+// 小元件
 // ===========================================================================
 function HeartIcon({ className }: { className?: string }) {
   return (
     <svg viewBox="0 0 24 24" className={cx('h-5 w-5', className)} fill="currentColor" aria-hidden="true">
       <path d="M12 21s-6.7-4.35-9.33-8.02C.9 10.6 1.9 6.5 5.2 5.5c2-.6 4 .2 5.2 1.9 1.2-1.7 3.2-2.5 5.2-1.9 3.3 1 4.3 5.1 2.53 7.48C18.7 16.65 12 21 12 21z" />
+    </svg>
+  );
+}
+
+function SpeakerIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" className={cx('h-6 w-6', className)} fill="currentColor" aria-hidden="true">
+      <path d="M4 9v6h4l5 4V5L8 9H4zm12.5 3a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4z" />
     </svg>
   );
 }
@@ -215,9 +152,7 @@ function PitchAccentBadge({ value, className }: { value?: string; className?: st
     return null;
   }
   return (
-    <sup className={cx('text-[0.55rem] font-semibold leading-none text-neutral-400', className)}>
-      {value}
-    </sup>
+    <sup className={cx('text-[0.55rem] font-semibold leading-none text-neutral-400', className)}>{value}</sup>
   );
 }
 
@@ -240,220 +175,464 @@ function Furigana({ word, reading, className }: { word: string; reading: string;
   );
 }
 
+/** 3D 大按鈕 */
+function BigButton({
+  tone,
+  disabled = false,
+  onClick,
+  children,
+}: {
+  tone: 'green' | 'red';
+  disabled?: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      onClick={onClick}
+      onTouchStart={noopTouch}
+      className={cx(
+        'w-full rounded-2xl border-b-4 py-4 text-center text-lg font-extrabold uppercase tracking-widest',
+        'touch-manipulation transition-all duration-150 [-webkit-tap-highlight-color:transparent]',
+        disabled
+          ? 'cursor-not-allowed border-neutral-300 bg-neutral-200 text-neutral-400'
+          : tone === 'green'
+            ? 'border-green-600 bg-green-500 text-white active:translate-y-[2px] active:border-b-2'
+            : 'border-red-600 bg-red-500 text-white active:translate-y-[2px] active:border-b-2',
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+// ===========================================================================
+// GPU 倒數條（第一層計時保護）
+// ===========================================================================
+interface TimerBarProps {
+  durationMs: number;
+  startedAt: number;
+  running: boolean;
+  onExpire: () => void;
+}
+
+/**
+ * - 掛載時計算「已經過的時間」，以負的 animation-delay 從該進度開始播放
+ * - 父層以 key={題目ID:timerEpoch} 掛載；App 回到前景時 timerEpoch 遞增 → 重新掛載 → 重新對時
+ * - 作答後 animation-play-state: paused，畫面凍結在作答當下
+ * - React 不逐幀更新任何 state
+ */
+function TimerBar({ durationMs, startedAt, running, onExpire }: TimerBarProps) {
+  const [elapsedAtMount] = useState(() => Math.min(durationMs, Math.max(0, Date.now() - startedAt)));
+
+  const handleAnimationEnd = (event: AnimationEvent<HTMLDivElement>): void => {
+    if (event.animationName === 'srsTimerShrink') onExpire();
+  };
+
+  return (
+    <div
+      role="timer"
+      aria-label={`限時 ${Math.round(durationMs / 1000)} 秒`}
+      className="mx-4 h-2 overflow-hidden rounded-full bg-neutral-100"
+    >
+      <div
+        className="h-full w-full origin-left rounded-full bg-red-500 will-change-transform"
+        style={{
+          animationName: 'srsTimerShrink',
+          animationDuration: `${durationMs}ms`,
+          animationTimingFunction: 'linear',
+          animationFillMode: 'forwards',
+          animationDelay: `-${elapsedAtMount}ms`,
+          animationPlayState: running ? 'running' : 'paused',
+        }}
+        onAnimationEnd={handleAnimationEnd}
+      />
+    </div>
+  );
+}
+
+// ===========================================================================
+// 題型畫面
+// ===========================================================================
+interface BodyProps<Q extends QuizQuestion> {
+  question: Q;
+  draft: QuizAnswer | null;
+  locked: boolean;
+  onChange: (answer: QuizAnswer | null) => void;
+}
+
+function WordMeaningBody({ question, draft, locked, onChange }: BodyProps<WordMeaningQuestion>) {
+  const selected = draft?.kind === 'WORD_MEANING' ? draft.optionIndex : null;
+
+  return (
+    <section>
+      <h2 className="mt-5 text-center text-xs font-bold uppercase tracking-widest text-neutral-400">
+        請選出正確的中文意思
+      </h2>
+
+      <div className="mt-8 flex flex-col items-center">
+        <div className="flex items-start justify-center gap-2">
+          <Furigana word={question.word} reading={question.reading} className="text-4xl font-bold text-neutral-800" />
+          <PitchAccentBadge value={question.pitchAccent} className="mt-1" />
+          <button
+            type="button"
+            onClick={() => speakJapanese(question.reading || question.word)}
+            onTouchStart={noopTouch}
+            aria-label="朗讀"
+            className="ml-1 mt-1 flex h-10 w-10 items-center justify-center rounded-xl border-2 border-b-4 border-sky-200 text-sky-500 active:translate-y-[2px] active:border-b-2"
+          >
+            <SpeakerIcon />
+          </button>
+        </div>
+        {question.romaji && <p className="mt-2 text-sm text-neutral-400">{question.romaji}</p>}
+      </div>
+
+      <div className="mx-auto mt-10 grid max-w-md grid-cols-1 gap-3">
+        {question.options.map((option, index) => {
+          const isSelected = selected === index;
+          const isCorrect = index === question.correctIndex;
+          return (
+            <button
+              key={question.id + '-' + index}
+              type="button"
+              disabled={locked}
+              onClick={() => onChange({ kind: 'WORD_MEANING', optionIndex: index })}
+              onTouchStart={noopTouch}
+              className={cx(
+                'w-full rounded-2xl border-2 border-b-4 px-5 py-4 text-left text-lg font-semibold transition-all duration-150',
+                locked && isCorrect
+                  ? 'border-green-500 border-b-green-600 bg-green-50 text-green-700'
+                  : locked && isSelected
+                    ? 'border-red-400 border-b-red-500 bg-red-50 text-red-600'
+                    : isSelected
+                      ? 'translate-y-[2px] border-sky-500 border-b-sky-600 bg-sky-50 text-sky-700'
+                      : 'border-neutral-200 border-b-neutral-300 bg-white text-neutral-800 active:translate-y-[2px]',
+              )}
+            >
+              {option}
+            </button>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function SentenceTilesBody({ question, draft, locked, onChange }: BodyProps<SentenceTilesQuestion>) {
+  const placed: readonly number[] = draft?.kind === 'SENTENCE_TILES' ? draft.tileIndexes : [];
+  const placedSet = new Set(placed);
+
+  const place = (tileIndex: number): void => {
+    onChange({ kind: 'SENTENCE_TILES', tileIndexes: [...placed, tileIndex] });
+  };
+  const removeAt = (position: number): void => {
+    const next = placed.filter((_, i) => i !== position);
+    onChange(next.length === 0 ? null : { kind: 'SENTENCE_TILES', tileIndexes: next });
+  };
+
+  return (
+    <section>
+      <h2 className="mt-5 text-center text-xs font-bold uppercase tracking-widest text-neutral-400">
+        請排出正確的句子
+      </h2>
+
+      <div className="mt-6 text-center">
+        <p className="text-2xl font-bold text-neutral-800">{question.meaning}</p>
+        <p className="mt-1 text-sm text-neutral-400">（依中文意思排出正確的日文語序）</p>
+      </div>
+
+      {/* 置字空格區 */}
+      <div className="mt-8 min-h-[4.5rem] rounded-2xl border-2 border-dashed border-neutral-200 p-3">
+        <div className="flex flex-wrap items-center gap-2">
+          {placed.map((tileIndex, position) => (
+            <button
+              key={'placed-' + position + '-' + tileIndex}
+              type="button"
+              disabled={locked}
+              onClick={() => removeAt(position)}
+              onTouchStart={noopTouch}
+              className="animate-srsPop rounded-xl border-2 border-b-4 border-sky-300 border-b-sky-400 bg-white px-4 py-2 text-lg font-semibold text-neutral-800 active:translate-y-[2px]"
+            >
+              {question.tiles[tileIndex]}
+            </button>
+          ))}
+          {placed.length === 0 && <span className="px-2 py-2 text-sm text-neutral-300">點下方字卡放入此處</span>}
+        </div>
+      </div>
+
+      {/* 下方碎字語塊 */}
+      <div className="mt-6 flex flex-wrap justify-center gap-3">
+        {question.tiles.map((tile, tileIndex) => {
+          const used = placedSet.has(tileIndex);
+          return (
+            <button
+              key={'tile-' + tileIndex}
+              type="button"
+              disabled={locked || used}
+              onClick={() => place(tileIndex)}
+              onTouchStart={noopTouch}
+              className={cx(
+                'rounded-xl border-2 border-b-4 px-4 py-3 text-lg font-semibold transition-all duration-150',
+                used
+                  ? 'border-neutral-200 border-b-neutral-200 bg-neutral-200 text-transparent'
+                  : 'border-neutral-200 border-b-neutral-300 bg-white text-neutral-800 active:translate-y-[2px]',
+              )}
+            >
+              {tile}
+            </button>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+/** 題型分派：完全窮舉，新增題型未處理時編譯期報錯 */
+function QuestionBody({ question, draft, locked, onChange }: BodyProps<QuizQuestion>) {
+  switch (question.kind) {
+    case 'WORD_MEANING':
+      return <WordMeaningBody question={question} draft={draft} locked={locked} onChange={onChange} />;
+    case 'SENTENCE_TILES':
+      return <SentenceTilesBody question={question} draft={draft} locked={locked} onChange={onChange} />;
+    default:
+      return assertNever(question);
+  }
+}
+
+/** 草稿是否已可檢查 */
+function isDraftComplete(question: QuizQuestion, draft: QuizAnswer | null): boolean {
+  if (draft === null) return false;
+  switch (question.kind) {
+    case 'WORD_MEANING':
+      return draft.kind === 'WORD_MEANING';
+    case 'SENTENCE_TILES':
+      return draft.kind === 'SENTENCE_TILES' && draft.tileIndexes.length === question.tiles.length;
+    default:
+      return assertNever(question);
+  }
+}
+
+// ===========================================================================
+// 結果卡片（由下往上滑出）
+// ===========================================================================
+function ResultSheet({
+  attempt,
+  question,
+  onContinue,
+}: {
+  attempt: QuizAttempt;
+  question: QuizQuestion;
+  onContinue: () => void;
+}) {
+  const correct = attempt.outcome === 'perfect' || attempt.outcome === 'passed';
+  const answer = describeCorrectAnswer(question);
+
+  return (
+    <div
+      role="status"
+      className={cx(
+        'w-full animate-srsSlideUp px-4 pb-[calc(1.5rem+env(safe-area-inset-bottom))] pt-5',
+        correct ? 'bg-green-100' : 'bg-red-100',
+      )}
+    >
+      {correct ? (
+        <div className="mb-4 flex items-center gap-3">
+          <span className="flex h-12 w-12 animate-srsPop items-center justify-center rounded-full bg-green-500 text-2xl font-black text-white">
+            ✓
+          </span>
+          <span className="text-2xl font-extrabold text-green-700">
+            {attempt.outcome === 'perfect' ? '太棒了！' : '勉強答對！'}
+          </span>
+          <span className="ml-auto text-lg font-extrabold text-green-600">+{attempt.xp} XP</span>
+        </div>
+      ) : (
+        <div className="mb-4">
+          <p className="text-lg font-extrabold text-red-600">
+            {attempt.outcome === 'timeout' ? '時間到！正確解答：' : '正確解答：'}
+          </p>
+          <p className="mt-1 text-xl font-bold text-red-700">{answer.main}</p>
+          <p className="mt-0.5 text-sm text-red-500">{answer.sub}</p>
+        </div>
+      )}
+
+      <BigButton tone={correct ? 'green' : 'red'} onClick={onContinue}>
+        繼續 Continue
+      </BigButton>
+    </div>
+  );
+}
+
 // ===========================================================================
 // 主元件
 // ===========================================================================
 export default function LessonView({ onExit }: LessonViewProps) {
-  const { cards, currentCard, dueCount, submitAnswer, isLoaded } = useSRS();
+  const { cards, dueCards, isLoaded, recordAttempt, saveError } = useSRS();
 
-  const [sessionTotal, setSessionTotal] = useState(0);
-  const [lives, setLives] = useState(INITIAL_LIVES);
+  // CONTINUE 時把結果交給 SRS：逾時不推進排程，其餘交給 SM-2
+  const handleCommit = useCallback(
+    (attempt: QuizAttempt) => {
+      recordAttempt(
+        attempt.cardId,
+        attempt.grade === null ? { kind: 'timeout' } : { kind: 'graded', grade: attempt.grade },
+      );
+    },
+    [recordAttempt],
+  );
 
-  const [phase, setPhase] = useState<Phase>('answering');
-  const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
-  const [placedIds, setPlacedIds] = useState<number[]>([]);
-  const [result, setResult] = useState<QuizResult | null>(null);
+  const engine = useQuizEngine({ maxHearts: INITIAL_LIVES, onCommit: handleCommit });
+  const { state, currentQuestion, timer } = engine;
 
-  // 本題開始時間（用於判斷「完美秒殺」或「勉強答對」）
-  const startedAtRef = useRef<number>(Date.now());
-  // 本次關卡累積的 XP（離開時回傳給 App）
-  const sessionXpRef = useRef<number>(0);
+  // 草稿綁定題目 ID：換題時自動失效
+  const [draft, setDraft] = useState<{ questionId: string; answer: QuizAnswer } | null>(null);
+  const currentDraft =
+    currentQuestion !== null && draft !== null && draft.questionId === currentQuestion.id ? draft.answer : null;
 
-  const card = currentCard;
-  const isWordType = card?.type === 'word';
+  const handleDraftChange = useCallback(
+    (answer: QuizAnswer | null) => {
+      if (currentQuestion === null) return;
+      setDraft(answer === null ? null : { questionId: currentQuestion.id, answer });
+    },
+    [currentQuestion],
+  );
 
-  // sessionTotal：本次會話一開始的待複習總數
+  // 新題目出現時自動朗讀（第一題已在「開始」手勢內朗讀，iOS 語音此後即已解鎖）
+  const spokenRef = useRef<string | null>(null);
   useEffect(() => {
-    if (card && sessionTotal === 0) {
-      setSessionTotal(dueCount);
+    if (state.status !== 'PLAYING' || currentQuestion === null) return;
+    if (currentQuestion.kind !== 'WORD_MEANING') return;
+    if (spokenRef.current === currentQuestion.id) return;
+    spokenRef.current = currentQuestion.id;
+    speakJapanese(speechTextFor(currentQuestion));
+  }, [state.status, currentQuestion]);
+
+  // IDLE：按下「開始」→ 建立題目快照、開始計時、在手勢內朗讀第一題
+  const handleStart = useCallback(() => {
+    const questions = buildLessonQuestions(dueCards, cards);
+    const first = questions[0];
+    if (first !== undefined && first.kind === 'WORD_MEANING') {
+      spokenRef.current = first.id;
+      speakJapanese(speechTextFor(first));
     }
-  }, [card, dueCount, sessionTotal]);
-
-  // 換題時重置題目層狀態，並重設本題計時起點
-  useEffect(() => {
-    setPhase('answering');
-    setSelectedIndex(null);
-    setPlacedIds([]);
-    setResult(null);
-    startedAtRef.current = Date.now();
-  }, [card?.id]);
-
-  // 題型 A：四選一選項（含 3 個干擾項）
-  const mcOptions = useMemo<McOption[]>(() => {
-    if (!card || card.type !== 'word') {
-      return [];
-    }
-    const uniqueMeanings = Array.from(
-      new Set(cards.filter((c) => c.id !== card.id && c.meaning !== card.meaning).map((c) => c.meaning)),
-    );
-    const distractors = shuffle(uniqueMeanings).slice(0, OPTION_COUNT - 1);
-    const options: McOption[] = [
-      { text: card.meaning, correct: true },
-      ...distractors.map((text) => ({ text, correct: false })),
-    ];
-    return shuffle(options);
-  }, [card, cards]);
-
-  // 題型 B：語塊拼圖
-  const sentenceTiles = useMemo<Tile[]>(() => {
-    if (!card || card.type !== 'sentence') {
-      return [];
-    }
-    const raw = card.tiles && card.tiles.length > 0 ? card.tiles : tokenizeSentence(card.word);
-    return raw.map((text, id) => ({ id, text }));
-  }, [card]);
-
-  const tileById = useMemo(
-    () => new Map(sentenceTiles.map((tile) => [tile.id, tile])),
-    [sentenceTiles],
-  );
-
-  const shuffledTileOrder = useMemo<number[]>(
-    () => shuffle(sentenceTiles.map((tile) => tile.id)),
-    [sentenceTiles],
-  );
-
-  const placedTiles = useMemo<Tile[]>(
-    () => placedIds.map((id) => tileById.get(id)).filter((tile): tile is Tile => tile !== undefined),
-    [placedIds, tileById],
-  );
-
-  const remainingTiles = useMemo<Tile[]>(
-    () =>
-      shuffledTileOrder
-        .filter((id) => !placedIds.includes(id))
-        .map((id) => tileById.get(id))
-        .filter((tile): tile is Tile => tile !== undefined),
-    [shuffledTileOrder, placedIds, tileById],
-  );
-
-  // 進度條百分比 = 已完成 / 總題數
-  const completed = Math.max(0, sessionTotal - dueCount);
-  const progressPct = sessionTotal > 0 ? Math.min(100, (completed / sessionTotal) * 100) : 0;
-
-  const canCheck =
-    phase === 'answering' &&
-    card !== null &&
-    (isWordType
-      ? selectedIndex !== null
-      : sentenceTiles.length > 0 && placedIds.length === sentenceTiles.length);
+    engine.start(questions);
+  }, [dueCards, cards, engine]);
 
   const handleCheck = useCallback(() => {
-    if (!card || phase !== 'answering') {
-      return;
+    if (currentQuestion !== null && currentDraft !== null && isDraftComplete(currentQuestion, currentDraft)) {
+      engine.submit(currentDraft);
     }
+  }, [currentQuestion, currentDraft, engine]);
 
-    let correct = false;
-    if (isWordType) {
-      if (selectedIndex === null) {
-        return;
-      }
-      correct = mcOptions[selectedIndex]?.correct === true;
-    } else {
-      if (sentenceTiles.length === 0 || placedIds.length !== sentenceTiles.length) {
-        return;
-      }
-      const built = placedIds.map((id) => tileById.get(id)?.text ?? '').join('');
-      const original = sentenceTiles.map((tile) => tile.text).join('');
-      correct = built === original;
-    }
-
-    // 依作答時間決定評分：答對且夠快 = 5（完美）、答對但慢 = 3（勉強）、答錯 = 0
-    const elapsed = Date.now() - startedAtRef.current;
-    const grade = correct ? (elapsed <= QUICK_ANSWER_MS ? 5 : 3) : 0;
-    setResult({ correct, timedOut: false, grade, xp: gradeToXp(grade) });
-    setPhase('result');
-    if (!correct) {
-      setLives((prev) => Math.max(0, prev - 1));
-    }
-  }, [card, phase, isWordType, selectedIndex, mcOptions, sentenceTiles, placedIds, tileById]);
-
-  // 逾時：由 CSS 動畫結束事件觸發（不逐毫秒 setInterval）
-  const handleTimeout = useCallback(() => {
-    if (phase !== 'answering' || !card) {
-      return;
-    }
-    setResult({ correct: false, timedOut: true, grade: TIMEOUT_GRADE, xp: gradeToXp(TIMEOUT_GRADE) });
-    setPhase('result');
-    setLives((prev) => Math.max(0, prev - 1));
-  }, [phase, card]);
-
-  // 繼續：正式把分數交給 useSRS 的 submitAnswer
-  const handleContinue = useCallback(() => {
-    if (!result) {
-      return;
-    }
-    submitAnswer(result.grade);
-    sessionXpRef.current += result.xp;
-    setPhase('answering');
-    setSelectedIndex(null);
-    setPlacedIds([]);
-    setResult(null);
-  }, [result, submitAnswer]);
-
-  const refillHearts = useCallback(() => setLives(INITIAL_LIVES), []);
-
-  // 離開關卡：把本次賺得的 XP 交回 App
+  // 離開關卡：只回傳已按 CONTINUE 提交的 XP
   const finish = useCallback(() => {
-    onExit?.(sessionXpRef.current);
-  }, [onExit]);
-
-  const correctAnswerMain = isWordType ? card?.meaning ?? '' : card?.word ?? '';
-  const correctAnswerSub = isWordType
-    ? (card?.word ?? '') + '（' + (card?.reading ?? '') + '）'
-    : (card?.reading ?? '') + '．' + (card?.meaning ?? '');
+    onExit?.(engine.earnedXp);
+  }, [onExit, engine.earnedXp]);
 
   // =========================================================================
-  // 早退分支（皆在所有 hook 之後）
+  // 載入中
   // =========================================================================
   if (!isLoaded) {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-white text-neutral-400">
-        載入中…
-      </div>
-    );
+    return <div className="flex min-h-screen items-center justify-center bg-white text-neutral-400">載入中…</div>;
   }
 
-  if (lives === 0 && phase === 'answering') {
+  // =========================================================================
+  // IDLE：預熱畫面
+  // =========================================================================
+  if (state.status === 'IDLE') {
+    if (dueCards.length === 0) {
+      return (
+        <div className="flex min-h-screen flex-col items-center justify-center gap-4 bg-white px-6 text-center">
+          <span className="text-6xl">🎉</span>
+          <h1 className="text-2xl font-extrabold text-neutral-800">今天沒有待複習的卡片</h1>
+          <p className="text-neutral-500">所有卡片都還沒到期，明天再來吧。</p>
+          <div className="mt-2 w-full max-w-xs">
+            <BigButton tone="green" onClick={finish}>
+              返回
+            </BigButton>
+          </div>
+        </div>
+      );
+    }
+
+    const count = Math.min(dueCards.length, MAX_LESSON_SIZE);
     return (
-      <div className="flex min-h-screen flex-col items-center justify-center gap-5 bg-white px-6 text-center">
-        <HeartIcon className="h-16 w-16 text-red-500" />
-        <h1 className="text-2xl font-extrabold text-neutral-800">愛心用完了！</h1>
-        <p className="max-w-xs text-neutral-500">別擔心，犯錯正是學習的一部分。補充愛心後繼續挑戰。</p>
-        <button
-          type="button"
-          onClick={refillHearts}
-          className="w-full max-w-xs rounded-2xl border-b-4 border-green-600 bg-green-500 py-4 text-lg font-extrabold text-white active:translate-y-[2px] active:border-b-2"
-        >
-          補充愛心 ❤ {INITIAL_LIVES}
-        </button>
+      <div className="flex min-h-screen flex-col items-center justify-center gap-5 bg-white px-6 pb-[calc(1.5rem+env(safe-area-inset-bottom))] pt-[calc(0.75rem+env(safe-area-inset-top))] text-center">
+        <span className="flex h-24 w-24 animate-srsPop items-center justify-center rounded-full border-b-[6px] border-[#46a302] bg-[#58cc02] text-5xl font-black text-white">
+          あ
+        </span>
+        <h1 className="text-3xl font-extrabold text-neutral-800">準備好了嗎？</h1>
+        <p className="max-w-xs text-neutral-500">
+          本關共 {count} 題，每題限時 {TIME_LIMIT_SECONDS.WORD_MEANING ?? 0} 秒。按下開始後才會開始計時與朗讀發音。
+        </p>
+        <div className="w-full max-w-xs">
+          <BigButton tone="green" onClick={handleStart}>
+            開始 Start
+          </BigButton>
+        </div>
         <button type="button" onClick={finish} className="text-sm font-semibold text-neutral-400 underline">
-          離開
+          返回地圖
         </button>
       </div>
     );
   }
 
-  if (!card) {
+  // =========================================================================
+  // FINISHED：完成 / 愛心用完
+  // =========================================================================
+  if (state.status === 'FINISHED') {
+    const correctCount = state.results.filter((r) => r.outcome === 'perfect' || r.outcome === 'passed').length;
+
+    if (state.reason === 'out_of_hearts') {
+      const canRefill = state.nextIndex < state.questions.length;
+      return (
+        <div className="flex min-h-screen flex-col items-center justify-center gap-5 bg-white px-6 text-center">
+          <HeartIcon className="h-16 w-16 animate-srsPop text-red-500" />
+          <h1 className="text-2xl font-extrabold text-neutral-800">愛心用完了！</h1>
+          <p className="max-w-xs text-neutral-500">
+            別擔心，犯錯正是學習的一部分。目前已獲得 {engine.earnedXp} XP。
+          </p>
+          {canRefill && (
+            <div className="w-full max-w-xs">
+              <BigButton tone="green" onClick={engine.refillHearts}>
+                補充愛心 ❤ {INITIAL_LIVES}
+              </BigButton>
+            </div>
+          )}
+          <button type="button" onClick={finish} className="text-sm font-semibold text-neutral-400 underline">
+            帶著 {engine.earnedXp} XP 離開
+          </button>
+        </div>
+      );
+    }
+
     return (
       <div className="flex min-h-screen flex-col items-center justify-center gap-4 bg-white px-6 text-center">
-        <span className="text-6xl">🎉</span>
+        <span className="animate-srsPop text-6xl">🎉</span>
         <h1 className="text-2xl font-extrabold text-neutral-800">今日複習完成！</h1>
-        <p className="text-neutral-500">你已完成 {completed} 張卡片的複習，明天見。</p>
-        <button
-          type="button"
-          onClick={finish}
-          className="mt-2 w-full max-w-xs rounded-2xl border-b-4 border-green-600 bg-green-500 py-4 text-lg font-extrabold text-white active:translate-y-[2px] active:border-b-2"
-        >
-          返回
-        </button>
+        <p className="text-neutral-500">
+          答對 {correctCount} / {state.results.length} 題
+        </p>
+        <p className="text-3xl font-extrabold text-amber-500">+{engine.earnedXp} XP</p>
+        <div className="mt-2 w-full max-w-xs">
+          <BigButton tone="green" onClick={finish}>
+            返回地圖
+          </BigButton>
+        </div>
       </div>
     );
   }
 
   // =========================================================================
-  // 主要畫面
+  // 作答中（PLAYING / ANSWER_SUBMITTED / TIMEOUT）
   // =========================================================================
+  if (currentQuestion === null) {
+    return null;
+  }
+
+  const locked = state.status !== 'PLAYING';
+  const progressPct = Math.min(100, engine.progress * 100);
+
   return (
     <div className="relative flex min-h-screen flex-col bg-white">
       {/* 頂部導覽列（避開瀏海） */}
@@ -461,6 +640,7 @@ export default function LessonView({ onExit }: LessonViewProps) {
         <button
           type="button"
           onClick={finish}
+          onTouchStart={noopTouch}
           aria-label="關閉"
           className="flex h-8 w-8 shrink-0 items-center justify-center text-neutral-400 active:scale-95"
         >
@@ -469,7 +649,7 @@ export default function LessonView({ onExit }: LessonViewProps) {
           </svg>
         </button>
 
-        {/* Duolingo 綠色發光進度條 */}
+        {/* Duolingo 綠色發光進度條（width + transition-all duration-500） */}
         <div className="h-4 flex-1 overflow-hidden rounded-full bg-neutral-200">
           <div
             className="h-full rounded-full bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.85)] transition-all duration-500 ease-out"
@@ -477,171 +657,63 @@ export default function LessonView({ onExit }: LessonViewProps) {
           />
         </div>
 
-        {/* 紅愛心與生命值 */}
-        <div className="flex shrink-0 items-center gap-1 text-red-500">
+        {/* 紅愛心與生命值（數字變動時彈跳） */}
+        <div
+          key={state.hearts}
+          className="flex shrink-0 animate-srsPop items-center gap-1 text-red-500"
+          aria-label={`剩餘 ${state.hearts} 顆愛心`}
+        >
           <HeartIcon />
-          <span className="text-base font-extrabold">{lives}</span>
+          <span className="text-base font-extrabold">{state.hearts}</span>
         </div>
       </header>
 
-      {/* 限時倒數條（純 CSS 動畫，GPU 合成） */}
-      {phase === 'answering' && (
-        <div className="mx-4 h-2 overflow-hidden rounded-full bg-neutral-100">
-          <div
-            key={card.id}
-            className="h-full w-full origin-left rounded-full bg-red-500 animate-srsTimerShrink"
-            onAnimationEnd={handleTimeout}
-          />
-        </div>
+      {/* 限時倒數條：key 含 timerEpoch，App 回到前景時重新掛載並對時 */}
+      {timer !== null && (
+        <TimerBar
+          key={timer.questionId + ':' + engine.timerEpoch}
+          durationMs={timer.durationMs}
+          startedAt={timer.startedAt}
+          running={state.status === 'PLAYING'}
+          onExpire={engine.notifyTimerEnd}
+        />
       )}
 
       {/* 題目區 */}
       <main className="flex-1 overflow-y-auto px-4 pb-56">
-        {isWordType ? (
-          <section>
-            <h2 className="mt-5 text-center text-xs font-bold uppercase tracking-widest text-neutral-400">
-              請選出正確的中文意思
-            </h2>
-
-            <div className="mt-8 flex flex-col items-center">
-              <div className="flex items-start justify-center">
-                <Furigana word={card.word} reading={card.reading} className="text-4xl font-bold text-neutral-800" />
-                <PitchAccentBadge value={card.pitchAccent} className="ml-1 mt-1" />
-              </div>
-              <p className="mt-2 text-sm text-neutral-400">{card.romaji}</p>
-            </div>
-
-            <div className="mx-auto mt-10 grid max-w-md grid-cols-1 gap-3">
-              {mcOptions.map((option, index) => {
-                const selected = selectedIndex === index;
-                return (
-                  <button
-                    key={option.text + '-' + index}
-                    type="button"
-                    disabled={phase === 'result'}
-                    onClick={() => setSelectedIndex(index)}
-                    className={cx(
-                      'w-full rounded-2xl border-2 border-b-4 px-5 py-4 text-left text-lg font-semibold transition-all duration-150',
-                      selected
-                        ? 'translate-y-[2px] border-sky-500 border-b-sky-600 bg-sky-50 text-sky-700'
-                        : 'border-neutral-200 border-b-neutral-300 bg-white text-neutral-800 active:translate-y-[2px]',
-                    )}
-                  >
-                    {option.text}
-                  </button>
-                );
-              })}
-            </div>
-          </section>
-        ) : (
-          <section>
-            <h2 className="mt-5 text-center text-xs font-bold uppercase tracking-widest text-neutral-400">
-              請排出正確的句子
-            </h2>
-
-            <div className="mt-6 text-center">
-              <p className="text-2xl font-bold text-neutral-800">{card.meaning}</p>
-              <p className="mt-1 text-sm text-neutral-400">（依中文意思排出正確的日文語序）</p>
-            </div>
-
-            {/* 置字空格區 */}
-            <div className="mt-8 min-h-[4.5rem] rounded-2xl border-2 border-dashed border-neutral-200 p-3">
-              <div className="flex flex-wrap items-center gap-2">
-                {placedTiles.map((tile) => (
-                  <button
-                    key={'placed-' + tile.id}
-                    type="button"
-                    disabled={phase === 'result'}
-                    onClick={() => setPlacedIds((ids) => ids.filter((id) => id !== tile.id))}
-                    className="rounded-xl border-2 border-b-4 border-sky-300 border-b-sky-400 bg-white px-4 py-2 text-lg font-semibold text-neutral-800 animate-srsPop active:translate-y-[2px]"
-                  >
-                    {tile.text}
-                  </button>
-                ))}
-                {placedTiles.length === 0 && (
-                  <span className="px-2 py-2 text-sm text-neutral-300">點下方字卡放入此處</span>
-                )}
-              </div>
-            </div>
-
-            {/* 下方碎字語塊 */}
-            <div className="mt-6 flex flex-wrap justify-center gap-3">
-              {remainingTiles.map((tile) => (
-                <button
-                  key={'tile-' + tile.id}
-                  type="button"
-                  disabled={phase === 'result'}
-                  onClick={() => setPlacedIds((ids) => [...ids, tile.id])}
-                  className="rounded-xl border-2 border-b-4 border-neutral-200 border-b-neutral-300 bg-white px-4 py-3 text-lg font-semibold text-neutral-800 transition-all duration-150 active:translate-y-[2px]"
-                >
-                  {tile.text}
-                </button>
-              ))}
-            </div>
-          </section>
+        {saveError !== null && (
+          <p role="alert" className="mt-3 rounded-xl bg-amber-100 px-3 py-2 text-sm text-amber-800">
+            進度未能寫入手機：{saveError}
+          </p>
         )}
+        <QuestionBody
+          key={currentQuestion.id}
+          question={currentQuestion}
+          draft={currentDraft}
+          locked={locked}
+          onChange={handleDraftChange}
+        />
       </main>
 
       {/* 底部固定區（避開 Home Indicator） */}
       <div className="fixed bottom-0 left-0 w-full">
-        {phase === 'answering' ? (
+        {state.status === 'PLAYING' ? (
           <div className="border-t border-neutral-200 bg-white px-4 pb-[calc(1.5rem+env(safe-area-inset-bottom))] pt-4">
-            <button
-              type="button"
-              disabled={!canCheck}
+            <BigButton
+              tone="green"
+              disabled={!isDraftComplete(currentQuestion, currentDraft)}
               onClick={handleCheck}
-              className={cx(
-                'w-full rounded-2xl border-b-4 py-4 text-center text-lg font-extrabold uppercase tracking-widest transition-all duration-150',
-                canCheck
-                  ? 'border-green-600 bg-green-500 text-white active:translate-y-[2px] active:border-b-2'
-                  : 'cursor-not-allowed border-neutral-300 bg-neutral-200 text-neutral-400',
-              )}
             >
               檢查答案 Check
-            </button>
+            </BigButton>
           </div>
         ) : (
-          result && (
-            <div
-              className={cx(
-                'w-full px-4 pb-[calc(1.5rem+env(safe-area-inset-bottom))] pt-5 animate-srsSlideUp',
-                result.correct ? 'bg-green-100' : 'bg-red-100',
-              )}
-            >
-              {result.correct ? (
-                <div className="mb-4 flex items-center gap-3">
-                  <span className="flex h-12 w-12 items-center justify-center rounded-full bg-green-500 text-2xl font-black text-white">
-                    ✓
-                  </span>
-                  <span className="text-2xl font-extrabold text-green-700">
-                    {result.grade >= 5 ? '太棒了！' : '勉強答對！'}
-                  </span>
-                  <span className="ml-auto text-lg font-extrabold text-green-600">
-                    +{result.xp} XP
-                  </span>
-                </div>
-              ) : (
-                <div className="mb-4">
-                  <p className="text-lg font-extrabold text-red-600">
-                    {result.timedOut ? '時間到！' : '正確解答：'}
-                  </p>
-                  <p className="mt-1 text-xl font-bold text-red-700">{correctAnswerMain}</p>
-                  <p className="mt-0.5 text-sm text-red-500">{correctAnswerSub}</p>
-                </div>
-              )}
-
-              <button
-                type="button"
-                onClick={handleContinue}
-                className={cx(
-                  'w-full rounded-2xl border-b-4 py-4 text-center text-lg font-extrabold uppercase tracking-widest text-white active:translate-y-[2px] active:border-b-2',
-                  result.correct ? 'border-green-600 bg-green-500' : 'border-red-600 bg-red-500',
-                )}
-              >
-                繼續 Continue
-              </button>
-            </div>
-          )
+          <ResultSheet
+            key={state.pending.questionId}
+            attempt={state.pending}
+            question={currentQuestion}
+            onContinue={engine.continueLesson}
+          />
         )}
       </div>
     </div>

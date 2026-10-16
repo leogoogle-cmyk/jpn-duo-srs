@@ -21,6 +21,8 @@ export interface LevelNode {
 interface HomeMapViewProps {
   /** 目前總 XP（來自 App 狀態） */
   xp: number;
+  /** 可選：XP 動畫起點（通常是進入關卡前的 XP） */
+  xpAnimateFrom?: number;
   /** 目前金幣 / 寶石數 */
   gems: number;
   /** 點擊 START 時的回呼，帶出該關卡 id */
@@ -69,10 +71,14 @@ function LockIcon({ className }: { className?: string }) {
   );
 }
 
-/** 數字滾動（count-up）動畫：XP 增加時平滑跳動（以 requestAnimationFrame） */
-function AnimatedNumber({ value, duration = 700 }: { value: number; duration?: number }) {
-  const [display, setDisplay] = useState<number>(value);
-  const displayRef = useRef<number>(value);
+/**
+ * 數字滾動（count-up）動畫：XP 增加時平滑跳動（以 requestAnimationFrame）。
+ * from：掛載時的起始顯示值。地圖在關卡期間會被卸載，返回時以「進關前的 XP」為起點，
+ *       才能看到數字從舊值滾動到新值。
+ */
+function AnimatedNumber({ value, from, duration = 900 }: { value: number; from?: number; duration?: number }) {
+  const [display, setDisplay] = useState<number>(from ?? value);
+  const displayRef = useRef<number>(from ?? value);
   displayRef.current = display;
 
   useEffect(() => {
@@ -101,7 +107,7 @@ function AnimatedNumber({ value, duration = 700 }: { value: number; duration?: n
 // ===========================================================================
 // 主元件
 // ===========================================================================
-export default function HomeMapView({ xp, gems, onStart, levels = DEFAULT_LEVELS }: HomeMapViewProps) {
+export default function HomeMapView({ xp, xpAnimateFrom, gems, onStart, levels = DEFAULT_LEVELS }: HomeMapViewProps) {
   // 目前被點開 Popover 的關卡 id
   const [activeId, setActiveId] = useState<string | null>(null);
 
@@ -121,7 +127,7 @@ export default function HomeMapView({ xp, gems, onStart, levels = DEFAULT_LEVELS
             <div className="flex items-center gap-1 text-amber-500">
               <StarIcon />
               <span className="font-extrabold">
-                <AnimatedNumber value={xp} />
+                <AnimatedNumber value={xp} from={xpAnimateFrom} />
               </span>
             </div>
             <div className="flex items-center gap-1 text-sky-500">

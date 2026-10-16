@@ -1,7 +1,8 @@
 // src/hooks/useSRS.tsx
 // ---------------------------------------------------------------------------
 // SRS 狀態管理：Context + Provider + useSRS hook
-// 持久化採 @capacitor/preferences（非同步，iOS / Web 通用）。
+// 持久化透過 ProgressStore 非同步接口（預設為 @capacitor/preferences 實作）。
+// 只寫入有變動的紀錄，未來換成分桶 / IndexedDB / SQLite 實作時可直接受惠。
 // 註：檔名為 .tsx，因內含 JSX（SRSProvider）。
 // ---------------------------------------------------------------------------
 import {
@@ -10,30 +11,39 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from 'react';
-import { Preferences } from '@capacitor/preferences';
 import type { Card, ReviewLog, SRSProgress } from '../core/types';
-import { applyReview, createInitialProgress, isDue } from '../core/srsEngine';
+import { applyAttemptToSrs, createInitialProgress, isDue, type SrsAttemptOutcome } from '../core/srsEngine';
+import { progressStore as defaultProgressStore, type ProgressMap, type ProgressStore } from '../core/progressStore';
 
-const STORAGE_KEY = 'jlpt-n5-srs:progress:v1';
 const MAX_LOGS = 200;
 
 interface SRSState {
   cards: Card[];
-  progressMap: Record<string, SRSProgress>;
+  progressMap: ProgressMap;
+  /** 今日到期的卡片 ID（依到期時間排序） */
   queue: string[];
+  /** 今日到期的卡片（與 queue 同順序） */
+  dueCards: Card[];
   currentCard: Card | null;
   dueCount: number;
   isLoaded: boolean;
   logs: ReviewLog[];
+  /** 最近一次寫入失敗的訊息；成功後清除 */
+  saveError: string | null;
 }
 
 interface SRSActions {
-  /** 提交一次作答評分（0/3/5），觸發 SM-2 並流轉至下一題 */
-  submitAnswer: (grade: number) => void;
-  /** 手動重算今日佇列 */
+  /**
+   * 記錄一次作答：
+   * - { kind: 'graded', grade } → SM-2 推進或重置排程
+   * - { kind: 'timeout' }       → 排程不變，只累加 timeouts
+   */
+  recordAttempt: (cardId: string, outcome: SrsAttemptOutcome) => void;
+  /** 以目前時間重算今日佇列 */
   reloadQueue: () => void;
   /** 重置全部進度 */
   resetProgress: () => void;
@@ -43,156 +53,164 @@ export interface SRSContextValue extends SRSState, SRSActions {}
 
 const SRSContext = createContext<SRSContextValue | null>(null);
 
-// --------------------- 非同步持久化（@capacitor/preferences）---------------------
-async function loadProgress(): Promise<Record<string, SRSProgress>> {
-  try {
-    const { value } = await Preferences.get({ key: STORAGE_KEY });
-    if (!value) return {};
-    const parsed: unknown = JSON.parse(value);
-    if (parsed && typeof parsed === 'object') {
-      return parsed as Record<string, SRSProgress>;
-    }
-    return {};
-  } catch (err) {
-    console.warn('[useSRS] 讀取進度失敗，將以空進度啟動：', err);
-    return {};
-  }
-}
-
-async function saveProgress(map: Record<string, SRSProgress>): Promise<void> {
-  try {
-    await Preferences.set({ key: STORAGE_KEY, value: JSON.stringify(map) });
-  } catch (err) {
-    console.warn('[useSRS] 儲存進度失敗：', err);
-  }
-}
-
 interface SRSProviderProps {
   cards: Card[];
   children: ReactNode;
+  /** 可替換的儲存實作（N1 規模時換成分桶或資料庫實作） */
+  store?: ProgressStore;
 }
 
-export function SRSProvider({ cards, children }: SRSProviderProps) {
-  const [progressMap, setProgressMap] = useState<Record<string, SRSProgress>>({});
-  const [queue, setQueue] = useState<string[]>([]);
+export function SRSProvider({ cards, children, store = defaultProgressStore }: SRSProviderProps) {
+  const [progressMap, setProgressMap] = useState<ProgressMap>({});
   const [logs, setLogs] = useState<ReviewLog[]>([]);
   const [isLoaded, setIsLoaded] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  /** 佇列計算的基準時間（作答或手動重算時更新） */
+  const [queueClock, setQueueClock] = useState<number>(() => Date.now());
 
-  // (1) 初次載入（僅執行一次）
+  /** 最新進度的同步副本，讓 action 不必依賴 render 週期 */
+  const progressRef = useRef<ProgressMap>({});
+
+  const commit = useCallback((next: ProgressMap) => {
+    progressRef.current = next;
+    setProgressMap(next);
+  }, []);
+
+  const persist = useCallback(
+    (records: SRSProgress[]) => {
+      if (records.length === 0) return;
+      store.upsertMany(records).then(
+        () => setSaveError(null),
+        (err: unknown) => {
+          console.warn('[useSRS] 儲存進度失敗：', err);
+          setSaveError(err instanceof Error ? err.message : '進度儲存失敗');
+        },
+      );
+    },
+    [store],
+  );
+
+  // (1) 初次載入
   useEffect(() => {
     let alive = true;
-    loadProgress()
-      .then((stored) => {
-        if (alive) setProgressMap(stored);
+    store
+      .loadAll()
+      .catch((err: unknown) => {
+        console.warn('[useSRS] 讀取進度失敗，將以空進度啟動：', err);
+        return {} as ProgressMap;
       })
-      .finally(() => {
-        if (alive) setIsLoaded(true);
+      .then((stored) => {
+        if (!alive) return;
+        commit(stored);
+        setQueueClock(Date.now());
+        setIsLoaded(true);
       });
     return () => {
       alive = false;
     };
+  }, [store, commit]);
+
+  // (2) 補齊新卡的初始進度（只寫入新增的紀錄）
+  useEffect(() => {
+    if (!isLoaded) return;
+    const now = Date.now();
+    const current = progressRef.current;
+    const added: SRSProgress[] = [];
+    for (const card of cards) {
+      if (!current[card.id]) added.push(createInitialProgress(card.id, now));
+    }
+    if (added.length === 0) return;
+    const next: ProgressMap = { ...current };
+    for (const record of added) next[record.cardId] = record;
+    commit(next);
+    persist(added);
+  }, [cards, isLoaded, commit, persist]);
+
+  // (3) 今日佇列：依 queueClock 判斷到期，依到期時間排序
+  const dueCards = useMemo(
+    () =>
+      cards
+        .filter((card) => {
+          const p = progressMap[card.id];
+          return p ? isDue(p, queueClock) : true;
+        })
+        .sort(
+          (a, b) =>
+            (progressMap[a.id]?.nextReviewDate ?? 0) - (progressMap[b.id]?.nextReviewDate ?? 0),
+        ),
+    [cards, progressMap, queueClock],
+  );
+  const queue = useMemo(() => dueCards.map((card) => card.id), [dueCards]);
+
+  const reloadQueue = useCallback(() => {
+    setQueueClock(Date.now());
   }, []);
 
-  // (2) 補齊每張卡的進度（cards 變動時；新卡立即到期）
-  useEffect(() => {
-    if (!isLoaded) return;
-    setProgressMap((prev) => {
-      let changed = false;
-      const next = { ...prev };
-      for (const card of cards) {
-        if (!next[card.id]) {
-          next[card.id] = createInitialProgress(card.id);
-          changed = true;
-        }
+  // (4) 記錄作答
+  const recordAttempt = useCallback(
+    (cardId: string, outcome: SrsAttemptOutcome) => {
+      const now = Date.now();
+      const current = progressRef.current;
+      const existing = current[cardId] ?? createInitialProgress(cardId, now);
+      const updated = applyAttemptToSrs(existing, outcome, now);
+
+      commit({ ...current, [cardId]: updated });
+      setQueueClock(now);
+      persist([updated]);
+
+      if (outcome.kind === 'graded') {
+        const entry: ReviewLog = {
+          cardId,
+          grade: outcome.grade,
+          reviewedAt: now,
+          prevInterval: existing.interval,
+          nextInterval: updated.interval,
+          prevEaseFactor: existing.easeFactor,
+          nextEaseFactor: updated.easeFactor,
+        };
+        setLogs((prev) => {
+          const next = [...prev, entry];
+          return next.length > MAX_LOGS ? next.slice(next.length - MAX_LOGS) : next;
+        });
       }
-      return changed ? next : prev;
-    });
-  }, [cards, isLoaded]);
-
-  // (3) 持久化（載入完成後才寫，避免覆蓋既有資料）
-  useEffect(() => {
-    if (!isLoaded) return;
-    void saveProgress(progressMap);
-  }, [progressMap, isLoaded]);
-
-  // (4) 依進度重算今日佇列
-  const reloadQueue = useCallback(() => {
-    const now = Date.now();
-    const due = cards
-      .filter((card) => {
-        const p = progressMap[card.id];
-        return p ? isDue(p, now) : true;
-      })
-      .sort(
-        (a, b) =>
-          (progressMap[a.id]?.nextReviewDate ?? 0) - (progressMap[b.id]?.nextReviewDate ?? 0),
-      )
-      .map((card) => card.id);
-    setQueue(due);
-  }, [cards, progressMap]);
-
-  useEffect(() => {
-    reloadQueue();
-  }, [reloadQueue]);
-
-  // (5) 提交作答：套用 SM-2，更新進度與紀錄（currentCard 會自動換到下一張）
-  const submitAnswer = useCallback(
-    (grade: number) => {
-      const currentId = queue[0];
-      if (!currentId) return;
-
-      const existing = progressMap[currentId] ?? createInitialProgress(currentId);
-      const updated = applyReview(existing, grade);
-
-      setProgressMap((prev) => ({ ...prev, [currentId]: updated }));
-
-      const entry: ReviewLog = {
-        cardId: currentId,
-        grade,
-        reviewedAt: Date.now(),
-        prevInterval: existing.interval,
-        nextInterval: updated.interval,
-        prevEaseFactor: existing.easeFactor,
-        nextEaseFactor: updated.easeFactor,
-      };
-      setLogs((prev) => {
-        const next = [...prev, entry];
-        return next.length > MAX_LOGS ? next.slice(next.length - MAX_LOGS) : next;
-      });
     },
-    [queue, progressMap],
+    [commit, persist],
   );
 
-  // (6) 重置
+  // (5) 重置
   const resetProgress = useCallback(() => {
-    const fresh: Record<string, SRSProgress> = {};
+    const now = Date.now();
+    const fresh: ProgressMap = {};
     for (const card of cards) {
-      fresh[card.id] = createInitialProgress(card.id);
+      fresh[card.id] = createInitialProgress(card.id, now);
     }
-    setProgressMap(fresh);
+    commit(fresh);
     setLogs([]);
-  }, [cards]);
+    setQueueClock(now);
+    store.replaceAll(fresh).then(
+      () => setSaveError(null),
+      (err: unknown) => setSaveError(err instanceof Error ? err.message : '進度重置失敗'),
+    );
+  }, [cards, commit, store]);
 
-  const currentCard = useMemo(() => {
-    const id = queue[0];
-    if (!id) return null;
-    return cards.find((c) => c.id === id) ?? null;
-  }, [queue, cards]);
+  const currentCard = dueCards[0] ?? null;
 
   const value = useMemo<SRSContextValue>(
     () => ({
       cards,
       progressMap,
       queue,
+      dueCards,
       currentCard,
       dueCount: queue.length,
       isLoaded,
       logs,
-      submitAnswer,
+      saveError,
+      recordAttempt,
       reloadQueue,
       resetProgress,
     }),
-    [cards, progressMap, queue, currentCard, isLoaded, logs, submitAnswer, reloadQueue, resetProgress],
+    [cards, progressMap, queue, dueCards, currentCard, isLoaded, logs, saveError, recordAttempt, reloadQueue, resetProgress],
   );
 
   return <SRSContext.Provider value={value}>{children}</SRSContext.Provider>;

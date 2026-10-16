@@ -3,10 +3,15 @@
 @tailwind utilities;
 
 /* ------------------------------------------------------------------
-   SRS 動畫關鍵影格（與 tailwind.config.js 的 animation 對應）
-   以 transform 觸發 GPU 合成，避免 iOS WebView 逐毫秒重排。
-   註：tailwind.config.js 亦宣告了同名 keyframes（雙保險，內容一致，
-      保留其一亦可，重複宣告不影響編譯）。
+   SRS 動畫關鍵影格（與 tailwind.config.js 的 keyframes 內容一致）
+   全部只動 transform / opacity，由 GPU 合成，避免 iOS WebView 重排。
+   - srsPop：字卡放入、愛心數字變動、結果圖示
+     （class：animate-srsPop）
+   - srsSlideUp：結果卡片由下往上滑出
+     （class：animate-srsSlideUp）
+   - srsTimerShrink：限時倒數條
+     （由 LessonView 的 TimerBar 以 inline style 指定時長與負的
+       animation-delay，因此不使用 animate-srsTimerShrink 固定 15s 的 class）
 ------------------------------------------------------------------ */
 @keyframes srsPop {
   from { transform: scale(0.85); opacity: 0.4; }
@@ -21,4 +26,19 @@
 @keyframes srsTimerShrink {
   from { transform: scaleX(1); }
   to   { transform: scaleX(0); }
+}
+
+/* 減少動態效果：裝飾動畫縮短；倒數條承載時間資訊，維持不變 */
+@media (prefers-reduced-motion: reduce) {
+  .animate-srsPop,
+  .animate-srsSlideUp {
+    animation-duration: 1ms !important;
+  }
+}
+
+/* iOS：避免整頁橡皮筋回彈與橫向旋轉時字級自動放大 */
+html,
+body {
+  overscroll-behavior: none;
+  -webkit-text-size-adjust: 100%;
 }
