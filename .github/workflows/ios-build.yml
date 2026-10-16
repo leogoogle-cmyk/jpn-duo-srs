@@ -8,10 +8,10 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     
-    - name: Set up Node.js
+    - name: Set up Node.js (2026 Node24 Standard)
       uses: actions/setup-node@v4
       with:
-        node-version: 20
+        node-version: 24
         
     - name: Install Dependencies
       run: |
@@ -21,9 +21,9 @@ jobs:
       run: |
         npm run build
         
-    - name: Force CocoaPods Update and Capacitor Sync
+    - name: Force Capacitor Sync
       run: |
-        npx cap shadow sync ios || npx cap sync ios
+        npx cap sync ios
         
     - name: Compile Unsigned App Package via Xcode CLI
       run: |
